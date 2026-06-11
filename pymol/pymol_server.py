@@ -1,84 +1,91 @@
 import os
+import queue
 import shlex
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP, Image
-from xmlrpc.client import ServerProxy
+from mcp.server.fastmcp import FastMCP
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 mcp = FastMCP("PyMOL")
 
-XMLRPC_PORT = 9123
-_proxy = ServerProxy(f"http://localhost:{XMLRPC_PORT}/RPC2")
+_proc: subprocess.Popen | None = None
+_queue: queue.Queue[str] = queue.Queue()
+_SENTINEL = "---PYMOL-MCP-DONE---"
 
 
 def _pymol_argv(*extra_args: str) -> list[str]:
-    """Build the argv list for launching PyMOL.
+    """Build argv for launching PyMOL.
 
     PYMOL_CMD in .env can be a bare executable or a full invocation, e.g.:
         PYMOL_CMD=pymol
-        PYMOL_CMD=/opt/conda/bin/pymol
+        PYMOL_CMD=C:\\ProgramData\\Anaconda3\\envs\\pymol\\Scripts\\pymol.exe
         PYMOL_CMD=conda run -n work pymol
     """
     cmd = os.environ.get("PYMOL_CMD", "pymol")
     return shlex.split(cmd) + list(extra_args)
 
 
+def _reader(proc: subprocess.Popen, q: queue.Queue) -> None:
+    """Background thread: drain proc.stdout into q line by line."""
+    for raw in proc.stdout:
+        q.put(raw.decode().rstrip("\n"))
+
+
+def _send(command: str, timeout: float = 15.0) -> str:
+    """Write one command to PyMOL stdin and collect output until the sentinel."""
+    global _proc
+    if _proc is None or _proc.poll() is not None:
+        return "Error: PyMOL is not running. Use open_pymol() first."
+    # flush=True ensures the sentinel line is pushed through the pipe immediately
+    _proc.stdin.write(f"{command}\nprint('{_SENTINEL}', flush=True)\n".encode())
+    _proc.stdin.flush()
+    lines = []
+    while True:
+        try:
+            line = _queue.get(timeout=timeout)
+        except queue.Empty:
+            return f"Error: timed out after {timeout}s waiting for PyMOL response."
+        if line == _SENTINEL:
+            break
+        lines.append(line)
+    return "\n".join(lines).strip() or "OK"
+
+
 @mcp.tool()
 def open_pymol() -> str:
-    """Open PyMOL with the built-in XML-RPC server enabled (port 9123)."""
-    argv = _pymol_argv("-R")
-    subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    """Launch PyMOL as a subprocess with stdin/stdout pipes for remote control."""
+    global _proc, _queue
+    if _proc is not None and _proc.poll() is None:
+        return "PyMOL is already running."
+    argv = _pymol_argv("-Q")
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    _proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    )
+    _queue = queue.Queue()
+    threading.Thread(target=_reader, args=(_proc, _queue), daemon=True).start()
     time.sleep(3)
-    return f"PyMOL opened (cmd: {argv}), XML-RPC server on port {XMLRPC_PORT}"
+    return f"PyMOL launched (cmd: {argv})"
 
 
 @mcp.tool()
 def run_pymol_command(command: str) -> str:
-    """Run a PyMOL command via the XML-RPC interface.
+    """Run a PyMOL command via stdin pipe.
 
     Args:
         command: A valid PyMOL command string, e.g. 'fetch 1abc', 'show cartoon'
     """
-    _proxy.do(command)
-    return f"Executed: {command}"
-
-
-# @mcp.tool()
-# def save_image(file_path: str, ray: bool = False, dpi: int = 150) -> str:
-#     """Save the current PyMOL view to a PNG file.
-
-#     Args:
-#         file_path: Absolute path for the output PNG file.
-#         ray: Whether to ray-trace before saving (slower but higher quality).
-#         dpi: Image resolution in DPI.
-#     """
-#     _proxy.do("zoom")
-#     if ray:
-#         _proxy.do("ray")
-#     _proxy.do(f"png {file_path}, dpi={dpi}")
-#     time.sleep(1)
-#     return f"Image saved to {file_path}"
-
-
-# @mcp.tool()
-# def get_screenshot(file_path: str, ray: bool = False) -> Image:
-#     """Capture the current PyMOL session as an image and return it.
-
-#     Args:
-#         file_path: Temporary path used to write the PNG, e.g. /tmp/view.png
-#         ray: Whether to ray-trace before capturing.
-#     """
-#     _proxy.do("zoom")
-#     if ray:
-#         _proxy.do("ray")
-#     _proxy.do(f"png {file_path}, dpi=150")
-#     time.sleep(1)
-#     return Image(path=file_path)
+    return _send(command)
 
 
 if __name__ == "__main__":

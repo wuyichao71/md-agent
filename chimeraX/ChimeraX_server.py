@@ -1,81 +1,91 @@
 import os
+import queue
 import shlex
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP, Image
-from xmlrpc.client import ServerProxy
+from mcp.server.fastmcp import FastMCP
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 mcp = FastMCP("ChimeraX")
 
-XMLRPC_PORT = 42184
-_proxy = ServerProxy(f"http://localhost:{XMLRPC_PORT}/RPC2")
+_proc: subprocess.Popen | None = None
+_queue: queue.Queue[str] = queue.Queue()
+_SENTINEL = "---CHIMERAX-MCP-DONE---"
 
 
 def _chimerax_argv(*extra_args: str) -> list[str]:
-    """Build the argv list for launching ChimeraX.
+    """Build argv for launching ChimeraX.
 
     CHIMERAX_CMD in .env can be a bare executable or a full invocation, e.g.:
         CHIMERAX_CMD=chimerax
-        CHIMERAX_CMD=/Applications/ChimeraX.app/Contents/bin/ChimeraX
+        CHIMERAX_CMD=C:\\Program Files\\ChimeraX\\bin\\ChimeraX.exe
         CHIMERAX_CMD=conda run -n chimerax ChimeraX
     """
     cmd = os.environ.get("CHIMERAX_CMD", "chimerax")
     return shlex.split(cmd) + list(extra_args)
 
 
+def _reader(proc: subprocess.Popen, q: queue.Queue) -> None:
+    """Background thread: drain proc.stdout into q line by line."""
+    for raw in proc.stdout:
+        q.put(raw.decode().rstrip("\n"))
+
+
+def _send(command: str, timeout: float = 15.0) -> str:
+    """Write one command to ChimeraX stdin and collect output until the sentinel."""
+    global _proc
+    if _proc is None or _proc.poll() is not None:
+        return "Error: ChimeraX is not running. Use open_chimerax() first."
+    # Use ChimeraX's Python escape to print the sentinel with immediate flush
+    _proc.stdin.write(f"{command}\npython print('{_SENTINEL}', flush=True)\n".encode())
+    _proc.stdin.flush()
+    lines = []
+    while True:
+        try:
+            line = _queue.get(timeout=timeout)
+        except queue.Empty:
+            return f"Error: timed out after {timeout}s waiting for ChimeraX response."
+        if line == _SENTINEL:
+            break
+        lines.append(line)
+    return "\n".join(lines).strip() or "OK"
+
+
 @mcp.tool()
 def open_chimerax() -> str:
-    """Open ChimeraX with remote XML-RPC control enabled (port 42184)."""
-    argv = _chimerax_argv("--cmd", f"remotecontrol xmlrpc true port {XMLRPC_PORT}")
-    subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    """Launch ChimeraX as a subprocess with stdin/stdout pipes for remote control."""
+    global _proc, _queue
+    if _proc is not None and _proc.poll() is None:
+        return "ChimeraX is already running."
+    argv = _chimerax_argv("--nogui")
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    _proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    )
+    _queue = queue.Queue()
+    threading.Thread(target=_reader, args=(_proc, _queue), daemon=True).start()
     time.sleep(4)
-    return f"ChimeraX opened (cmd: {argv}), XML-RPC server on port {XMLRPC_PORT}"
+    return f"ChimeraX launched (cmd: {argv})"
 
 
 @mcp.tool()
 def run_chimerax_command(command: str) -> str:
-    """Run a ChimeraX command via the XML-RPC interface.
+    """Run a ChimeraX command via stdin pipe.
 
     Args:
         command: A valid ChimeraX command string, e.g. 'open 1abc', 'cartoon'
     """
-    result = _proxy.run_command(command)
-    return str(result) if result else f"Executed: {command}"
-
-
-# @mcp.tool()
-# def save_image(file_path: str, width: int = 1920, height: int = 1080, supersample: int = 3) -> str:
-#     """Save the current ChimeraX view to an image file.
-
-#     Args:
-#         file_path: Absolute path for the output image (PNG recommended).
-#         width: Image width in pixels.
-#         height: Image height in pixels.
-#         supersample: Anti-aliasing level (1-4).
-#     """
-#     _proxy.run_command(
-#         f"save {file_path} width {width} height {height} supersample {supersample}"
-#     )
-#     return f"Image saved to {file_path}"
-
-
-# @mcp.tool()
-# def get_screenshot(file_path: str, width: int = 1920, height: int = 1080) -> Image:
-#     """Capture the current ChimeraX session as an image and return it.
-
-#     Args:
-#         file_path: Temporary path used to write the PNG, e.g. /tmp/view.png
-#         width: Image width in pixels.
-#         height: Image height in pixels.
-#     """
-#     _proxy.run_command(f"save {file_path} width {width} height {height} supersample 3")
-#     time.sleep(0.5)
-#     return Image(path=file_path)
+    return _send(command)
 
 
 if __name__ == "__main__":
